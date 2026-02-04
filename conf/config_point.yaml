@@ -16,9 +16,25 @@ preprocess:
 model:
   motion_encoder: vit_base_patch16_224_in21k
   text_encoder: distilbert-base-uncased
+  point_encoder:
+    dvae_config:
+      encoder_dim: 256
+      group_size: 32
+      num_group: 64
+      num_tokens: 512
+    transformer_config:
+      embed_dim: 768
+      depth: 4
+      num_heads: 12
+      mlp_ratio: 4.0
+      qkv_bias: false
+      qk_scale: null
+      drop_rate: 0.0
+      attn_drop_rate: 0.0
+      drop_path_rate: 0.1
 
 train:
-  batch_size: 4
+  batch_size: 32
   epoch: 50
   optimizer:
     motion_lr: 1.0e-05

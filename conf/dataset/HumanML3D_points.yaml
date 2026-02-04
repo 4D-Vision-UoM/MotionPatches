@@ -3,8 +3,8 @@ data_root: ./data/v4.3-wall-humanML3d-2136
 motion_dir: ${dataset.data_root}/new_joints
 text_dir: ${dataset.data_root}/texts/texts
 joints_num: 22
-max_motion_length: 224
-num_frames: 196
+max_motion_length: 16
+num_frames: 16
 num_points: 2048
 num_workers: 24
 times: 1

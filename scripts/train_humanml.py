@@ -193,6 +193,14 @@ def prepare_model(cfg, train_dataloader):
         text_encoder_alias, TOKENIZERS_PARALLELISM=True
     )
 
+    # Prepare point encoder config if available
+    point_encoder_config = None
+    if "point_encoder" in cfg.model:
+        point_encoder_config = {
+            "dvae_config": dict(cfg.model.point_encoder.dvae_config),
+            "transformer_config": dict(cfg.model.point_encoder.transformer_config),
+        }
+
     model = ClipModel(
         motion_encoder_alias,
         text_encoder_alias,
@@ -205,7 +213,8 @@ def prepare_model(cfg, train_dataloader):
         patch_size=cfg.train.patch_size,
         dropout=0.5 if cfg.dataset.dataset_name == "HumanML3D" else 0.0,
         num_frames=cfg.dataset.num_frames,
-        num_groups=64,
+        num_groups=point_encoder_config["dvae_config"]["num_group"] if point_encoder_config else 64,
+        point_encoder_config=point_encoder_config,
     )
 
     model.to(device)

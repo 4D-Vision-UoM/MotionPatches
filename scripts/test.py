@@ -26,7 +26,9 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, os.getcwd())
 from datasets import TextMotionPatchDataset
+from datasets.humanML import HumanMLDataset, collate_fn
 from models.clip import ClipModel
+from models.clip_point import ClipModel as ClipModelPoint
 
 log = logging.getLogger(__name__)
 
@@ -41,25 +43,44 @@ def main(cfg: DictConfig) -> None:
 
 
 def prepare_test_dataset(cfg):
-    mean = np.load(pjoin(cfg.dataset.data_root, "Mean_raw.npy"))
-    std = np.load(pjoin(cfg.dataset.data_root, "Std_raw.npy"))
-
-    if cfg.eval.eval_train:
-        test_split_file = pjoin(cfg.dataset.data_root, "train.txt")
+    # Check if using point cloud dataset
+    if hasattr(cfg.dataset, 'num_points'):
+        # Point cloud dataset
+        test_dataset = HumanMLDataset(
+            data_root=cfg.dataset.data_root,
+            seed=cfg.train.seed,
+            split="test" if not cfg.eval.eval_train else "train",
+            num_frames=cfg.dataset.num_frames,
+            num_points=cfg.dataset.num_points
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=cfg.train.batch_size,
+            shuffle=False,
+            num_workers=cfg.dataset.num_workers if hasattr(cfg.dataset, 'num_workers') else 4,
+            collate_fn=collate_fn
+        )
     else:
-        test_split_file = pjoin(cfg.dataset.data_root, "test.txt")
-    test_dataset = TextMotionPatchDataset(
-        cfg,
-        mean,
-        std,
-        test_split_file,
-        eval_mode=True,
-        patch_size=cfg.train.patch_size,
-        fps=True,
-    )
-    test_dataloader = DataLoader(
-        test_dataset, batch_size=cfg.train.batch_size, shuffle=False, num_workers=16
-    )
+        # Original patch dataset
+        mean = np.load(pjoin(cfg.dataset.data_root, "Mean_raw.npy"))
+        std = np.load(pjoin(cfg.dataset.data_root, "Std_raw.npy"))
+
+        if cfg.eval.eval_train:
+            test_split_file = pjoin(cfg.dataset.data_root, "train.txt")
+        else:
+            test_split_file = pjoin(cfg.dataset.data_root, "test.txt")
+        test_dataset = TextMotionPatchDataset(
+            cfg,
+            mean,
+            std,
+            test_split_file,
+            eval_mode=True,
+            patch_size=cfg.train.patch_size,
+            fps=True,
+        )
+        test_dataloader = DataLoader(
+            test_dataset, batch_size=cfg.train.batch_size, shuffle=False, num_workers=16
+        )
     return test_dataloader
 
 
@@ -74,14 +95,38 @@ def prepare_test_model(cfg):
 
     tokenizer = AutoTokenizer.from_pretrained(text_encoder_alias)
 
-    model = ClipModel(
-        motion_encoder_alias=motion_encoder_alias,
-        text_encoder_alias=text_encoder_alias,
-        motion_embedding_dims=motion_embedding_dims,
-        text_embedding_dims=text_embedding_dims,
-        projection_dims=projection_dims,
-        patch_size=cfg.train.patch_size,
-    )
+    # Check if using point cloud model
+    if hasattr(cfg.dataset, 'num_points'):
+        # Point cloud model
+        point_encoder_config = None
+        if hasattr(cfg.model, 'point_encoder'):
+            point_encoder_config = {
+                "dvae_config": dict(cfg.model.point_encoder.dvae_config),
+                "transformer_config": dict(cfg.model.point_encoder.transformer_config),
+            }
+        
+        model = ClipModelPoint(
+            motion_encoder_alias=motion_encoder_alias,
+            text_encoder_alias=text_encoder_alias,
+            motion_embedding_dims=motion_embedding_dims,
+            text_embedding_dims=text_embedding_dims,
+            projection_dims=projection_dims,
+            patch_size=cfg.train.patch_size,
+            dropout=0.5 if cfg.dataset.dataset_name == "HumanML3D" else 0.0,
+            num_frames=cfg.dataset.num_frames,
+            num_groups=point_encoder_config["dvae_config"]["num_group"] if point_encoder_config else 64,
+            point_encoder_config=point_encoder_config,
+        )
+    else:
+        # Original patch model
+        model = ClipModel(
+            motion_encoder_alias=motion_encoder_alias,
+            text_encoder_alias=text_encoder_alias,
+            motion_embedding_dims=motion_embedding_dims,
+            text_embedding_dims=text_embedding_dims,
+            projection_dims=projection_dims,
+            patch_size=cfg.train.patch_size,
+        )
 
     if cfg.eval.use_best_model:
         model_path = pjoin(cfg.checkpoints_dir, "best_model.pt")
@@ -114,7 +159,14 @@ def eval(cfg, test_dataloader, model, tokenizer=None, verbose=True):
         test_pbar = tqdm(test_dataloader, leave=False)
         for batch in test_pbar:
             step += 1
-            texts, motions, m_length, img_indexs = batch
+            # Handle both old format (4 values) and new format (2 values)
+            if len(batch) == 4:
+                texts, motions, m_length, img_indexs = batch
+            else:
+                motions, texts = batch
+                # Generate dummy img_indexs based on batch position
+                img_indexs = torch.arange(len(texts)) + step * len(texts)
+            
             motions = motions.to(device)
 
             texts_token = tokenizer(
@@ -135,7 +187,10 @@ def eval(cfg, test_dataloader, model, tokenizer=None, verbose=True):
                 all_captions_feat.append(text_features[i].cpu().numpy())
 
                 all_captions.append(texts[i])
-                all_img_idxs.append(img_indexs[i].item())
+                if isinstance(img_indexs, torch.Tensor):
+                    all_img_idxs.append(img_indexs[i].item())
+                else:
+                    all_img_idxs.append(img_indexs[i])
 
     all_captions = np.array(all_captions)
     for img_idx, caption in zip(all_img_idxs, all_captions):

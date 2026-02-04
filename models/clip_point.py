@@ -16,7 +16,9 @@ import timm
 import torch
 import transformers
 from torch import nn
-from models.pointnet import PointnetEncoder
+from omegaconf import DictConfig
+from models.pointnet import PointnetTransformer
+
 
 class ProjectionHead(nn.Module):
     def __init__(self, embedding_dim: int, projection_dim: int, dropout: float) -> None:
@@ -62,18 +64,19 @@ class MotionEncoder(nn.Module):
         pretrained: bool = True,
         trainable: bool = True,
         patch_size=16,
-        in_chans=512,
-        img_size=(224, 64),
+        num_frames=224,
+        feature_dim=512,
     ) -> None:
         super().__init__()
-
+        
+        # Image size: [height=num_frames, width=feature_dim (multiple of patch_size)]
+        # feature_dim should be patch_size * some_value to leverage pretrained weights
         self.model = timm.create_model(
             model_name,
             pretrained=pretrained,
             num_classes=0,
             global_pool="avg",
-            img_size=img_size,
-            in_chans=in_chans,
+            img_size=(num_frames, feature_dim),
         )
 
         for param in self.model.parameters():
@@ -99,24 +102,70 @@ class ClipModel(nn.Module):
         dropout: float = 0.5,
         logit: float = 0.07,
         patch_size: int = 16,
-        num_frames: int = 196,
+        num_frames: int = 224,
         num_groups: int = 64,
+        point_encoder_config: dict = None,
     ) -> None:
         super().__init__()
+        
+        self.num_frames = num_frames
+        self.patch_size = patch_size
+        
+        # Initialize PointNet + Transformer encoder for point cloud processing
+        if point_encoder_config is None:
+            point_encoder_config = {
+                "dvae_config": {
+                    "encoder_dim": 256,
+                    "group_size": 32,
+                    "num_group": num_groups,
+                    "num_tokens": 512,
+                },
+                "transformer_config": {
+                    "embed_dim": 768,
+                    "depth": 4,
+                    "num_heads": 12,
+                    "mlp_ratio": 4.0,
+                    "qkv_bias": False,
+                    "qk_scale": None,
+                    "drop_rate": 0.0,
+                    "attn_drop_rate": 0.0,
+                    "drop_path_rate": 0.1,
+                },
+            }
+        
+        dvae_config = DictConfig(point_encoder_config["dvae_config"])
+        transformer_config = DictConfig(point_encoder_config["transformer_config"])
+        
+        self.point_encoder = PointnetTransformer(
+            dvae_config=dvae_config,
+            transformer_config=transformer_config,
+        )
+        
+        # Output dimension from PointnetTransformer
+        point_output_dim = dvae_config["num_tokens"] if "num_tokens" in dvae_config else 512
+        # Ensure feature_dim is a multiple of patch_size for pretrained weights
+        feature_dim = ((point_output_dim + patch_size - 1) // patch_size) * patch_size
+        
+        # Store feature dimension for later use
+        self.feature_dim = feature_dim
+        
+        # If point encoder output doesn't match required dimension, add projection
+        if point_output_dim != feature_dim:
+            self.point_to_image = nn.Linear(point_output_dim, feature_dim)
+        else:
+            self.point_to_image = nn.Identity()
 
         motion_encoder = MotionEncoder(
             model_name=motion_encoder_alias,
             pretrained=motion_encoder_pretrained,
             trainable=motion_encoder_trainable,
             patch_size=patch_size,
-            in_chans=512,
-            img_size=(num_frames, num_groups),  # Dynamic based on dataset
+            num_frames=num_frames,
+            feature_dim=feature_dim,
         )
         text_encoder = TextEncoder(
             model_name=text_encoder_alias, trainable=text_encoder_trainable
         )
-        
-        self.point_encoder = PointnetEncoder()
 
         self.motion_encoder = motion_encoder
         self.text_encoder = text_encoder
@@ -137,26 +186,34 @@ class ClipModel(nn.Module):
         self.log_softmax = nn.LogSoftmax(dim=-1)
 
     def encode_motion(self, motion):
-        B, T, N, C = motion.shape  # B, num_frames, num_points, channels (3 for XYZ or 9 for full)
+        #dataset give 9 features per point, we only need xyz
         
-        # Extract only XYZ coordinates (first 3 channels)
-        motion_xyz = motion[:, :, :, :3]  # B, T, N, 3
+        motion = motion[..., :3]
+        # motion shape: [batch, frames, points, 3]
+        batch_size, frames, points, _ = motion.shape
         
-        # Reshape to process all frames at once
-        motion_xyz = motion_xyz.view(B * T, N, 3)  # (B*T), N, 3
+        # Flatten batch and frames for efficient processing: [batch*frames, points, 3]
+        motion_flat = motion.view(batch_size * frames, points, 3)
         
-        # Encode with PointNet to get group features
-        motion_points = self.point_encoder(motion_xyz)  # (B*T), G, C where G=64, C=512
+        # Process all frames at once through PointNet + Transformer
+        # Returns: [batch*frames, 3, feature_dim] - already stacked cls, mean, max
+        point_feats = self.point_encoder(motion_flat)
         
-        # Reshape to motion-image format [B, C, T, G]
-        # (B*T), G, C -> B, T, G, C -> B, C, T, G
-        BT, G, C_feat = motion_points.shape
-        motion_points = motion_points.view(B, T, G, C_feat)  # B, T, G, C
-        motion_points = motion_points.permute(0, 3, 1, 2)  # B, C, T, G = B, 512, T, 64
+        # Project to ensure feature_dim alignment if needed
+        # point_feats shape: [batch*frames, 3, feature_dim]
+        batch_frames, num_channels, feat_dim = point_feats.shape
+        point_feats = point_feats.view(batch_frames * num_channels, feat_dim)
+        point_feats = self.point_to_image(point_feats)
+        point_feats = point_feats.view(batch_frames, num_channels, -1)  # [batch*frames, 3, feature_dim]
         
-        # Pass through ViT motion encoder
-        motion_features = self.motion_encoder(motion_points)  # B, embedding_dim
+        # Reshape to separate batch and frames: [batch, frames, 3, feature_dim]
+        point_feats = point_feats.view(batch_size, frames, num_channels, -1)
         
+        # Permute to match image format: [batch, 3, frames, feature_dim]
+        motion_image = point_feats.permute(0, 2, 1, 3)  # [batch, 3, frames, feature_dim]
+        
+        # Process through motion encoder
+        motion_features = self.motion_encoder(motion_image)
         motion_embeddings = self.motion_projection(motion_features)
         return motion_embeddings
 

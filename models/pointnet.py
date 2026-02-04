@@ -1,4 +1,4 @@
-"""Definition of Point Encoder"""
+"""Definition of Point Encoder used in CrossMoST"""
 
 # Credits: https://github.com/theamaya/CrossMoST
 # pylint: disable=missing-function-docstring,missing-class-docstring,invalid-name
@@ -6,7 +6,133 @@
 
 import torch
 from torch import nn
+from torch.nn.init import trunc_normal_
+from omegaconf import DictConfig
+from torch.nn.init import trunc_normal_
+from timm.layers import DropPath
 
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def init_trans_weights(m, init_std):
+    """Initializes weights for a transformer model"""
+    if isinstance(m, nn.Linear):
+        trunc_normal_(m.weight, std=init_std)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.constant_(m.bias, 0)
+        nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.Conv2d):
+        trunc_normal_(m.weight, std=init_std)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn
+
+
+class Block(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = MLP(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+        )
+
+    def forward(self, x, return_attention=False):
+        y, attn = self.attn(self.norm1(x))
+        if return_attention:
+            return attn
+        x = x + self.drop_path(y)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
 
 
 def index_points(points, idx):
@@ -165,75 +291,161 @@ class Encoder(nn.Module):
         return feature_global.reshape(bs, g, self.encoder_channel)
 
 
-# class TransformerEncoder(nn.Module):
-#     """Transformer Encoder without hierarchical structure"""
+class TransformerEncoder(nn.Module):
+    """Transformer Encoder without hierarchical structure"""
 
-#     # pylint: disable=too-many-positional-arguments
-#     def __init__(
-#         self,
-#         embed_dim=768,
-#         depth=4,
-#         num_heads=12,
-#         mlp_ratio=4.0,
-#         qkv_bias=False,
-#         qk_scale=None,
-#         drop_rate=0.0,
-#         attn_drop_rate=0.0,
-#         drop_path_rate=0.0,
-#     ):
-#         super().__init__()
-
-#         # pylint: disable=duplicate-code
-#         self.blocks = nn.ModuleList(
-#             [
-#                 Block(
-#                     dim=embed_dim,
-#                     num_heads=num_heads,
-#                     mlp_ratio=mlp_ratio,
-#                     qkv_bias=qkv_bias,
-#                     qk_scale=qk_scale,
-#                     drop=drop_rate,
-#                     attn_drop=attn_drop_rate,
-#                     drop_path=(
-#                         drop_path_rate[i]
-#                         if isinstance(drop_path_rate, list)
-#                         else drop_path_rate
-#                     ),
-#                 )
-#                 for i in range(depth)
-#             ]
-#         )
-#         # pylint: enable=duplicate-code
-
-#     def forward(self, x, pos):
-#         for _, block in enumerate(self.blocks):
-#             x = block(x + pos)
-#         return x
-
-
-class PointnetEncoder(nn.Module):
-    def __init__(self, num_input=2048, num_groups=64, group_size=32, encoder_dim=512, return_centroids=False):
+    # pylint: disable=too-many-positional-arguments
+    def __init__(
+        self,
+        embed_dim=768,
+        depth=4,
+        num_heads=12,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+    ):
         super().__init__()
-        self.num_input = num_input
-        self.num_groups = num_groups
-        self.group_size = group_size
-        self.encoder_dim = encoder_dim
-        self.return_centroids = return_centroids
-        
+
+        # pylint: disable=duplicate-code
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    qk_scale=qk_scale,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=(
+                        drop_path_rate[i]
+                        if isinstance(drop_path_rate, list)
+                        else drop_path_rate
+                    ),
+                )
+                for i in range(depth)
+            ]
+        )
+        # pylint: enable=duplicate-code
+
+    def forward(self, x, pos):
+        for _, block in enumerate(self.blocks):
+            x = block(x + pos)
+        return x
+
+
+class PointnetTransformer(nn.Module):
+
+    def __init__(self, dvae_config: DictConfig, transformer_config: DictConfig):
+        super().__init__()
+        self.encoder_dim = 256 #dvae_config["encoder_dim"]
         self.encoder = Encoder(encoder_channel=self.encoder_dim)
-        self.group_divider = Group(num_group=self.num_groups, group_size=self.group_size)
+        # self._prepare_encoder(dvae_config["ckpt"])
 
-    def forward(self, x):
-        """
-        x: B N 3
-        ----------------
-        feature_global: B G C (B, 64, 512) -> can be reshaped to (B, 512, 8, 8) for ViT
-        """
-        neighborhood, centroids = self.group_divider(x)  # B G M 3
-        feature_global = self.encoder(neighborhood)  # B G C
-        # feature_global = torch.max(feature_global, dim=1, keepdim=False)[0]  # B C
-        if self.return_centroids:
-            return feature_global, centroids
-        return feature_global
+        # self.projection = torch.nn.Linear(768, 512)
 
+        # self.pc_projection = nn.Parameter(torch.empty(768, 512))
+        # nn.init.normal_(self.pc_projection, std=512 ** -0.5)
 
+        self.group_size = 32 #dvae_config["group_size"]
+        self.num_group = 64 #dvae_config["num_group"]
+        self.num_groups = 64 #dvae_config["num_group"]
+
+        self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
+
+        # define the transformer argparse
+        # self.mask_ratio = transformer_config["mask_ratio"]
+        # self.trans_dim = transformer_config["trans_dim"]
+        # self.depth = transformer_config["depth"]
+        # self.drop_path_rate = transformer_config["drop_path_rate"]
+        # self.cls_dim = transformer_config["cls_dim"]
+        # self.replace_pob = transformer_config["replace_pob"]
+        # self.num_heads = transformer_config["num_heads"]
+        embed_dim = 768
+
+        # bridge encoder and transformer
+        self.reduce_dim = nn.Linear(self.encoder_dim, embed_dim)
+
+        # define the learnable tokens
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.cls_pos = nn.Parameter(torch.randn(1, 1, embed_dim))
+
+        # pos embedding for each patch
+        self.pos_embed = nn.Sequential(
+            nn.Linear(3, 128), nn.GELU(), nn.Linear(128, embed_dim)
+        )
+
+        # define the transformer blocks
+        dpr = transformer_config.pop("drop_path_rate")
+        dpr = [x.item() for x in torch.linspace(0, dpr, transformer_config["depth"])]
+        self.blocks = TransformerEncoder(**transformer_config, drop_path_rate=dpr)
+
+        # layer norm
+        self.norm = nn.LayerNorm(embed_dim)
+        # head for token classification
+        self.num_tokens = dvae_config["num_tokens"]
+        self.output_dim = 512
+        
+        self.out_projection = nn.Linear(embed_dim, self.output_dim)
+
+        # initialize the learnable tokens
+        trunc_normal_(self.cls_token, std=0.02)
+        trunc_normal_(self.cls_pos, std=0.02)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        init_trans_weights(0.02, m)
+
+    # def _prepare_encoder(self, dvae_ckpt):
+    #     ckpt = torch.load(dvae_ckpt, map_location="cpu", weights_only=True)
+    #     base_ckpt = {k.replace("module.", ""): v for k, v in ckpt["base_model"].items()}
+    #     encoder_ckpt = {
+    #         k.replace("encoder.", ""): v for k, v in base_ckpt.items() if "encoder" in k
+    #     }
+
+    #     self.encoder.load_state_dict(encoder_ckpt, strict=True)
+    #     io_stream(f"[Encoder] Successful Loading the ckpt for encoder from {dvae_ckpt}")
+    #     # pylint: disable=attribute-defined-outside-init
+    #     self.encoder.requires_grad = False
+
+    def forward(self, pts, mask=None):
+        neighborhood, center = self.group_divider(pts)
+        # encode the input cloud blocks
+        group_input_tokens = self.encoder(neighborhood)  # B G N
+        group_input_tokens = self.reduce_dim(group_input_tokens)
+
+        batch_size, num_groups, _ = group_input_tokens.shape
+
+        if mask is not None:
+            # Apply mask to keep only the required tokens
+            group_input_tokens = group_input_tokens[
+                torch.arange(batch_size).unsqueeze(1), mask
+            ]
+            center = center[torch.arange(batch_size).unsqueeze(1), mask]
+
+        # prepare cls
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        cls_pos = self.cls_pos.expand(batch_size, -1, -1)
+
+        # add positional embeddings
+        pos = self.pos_embed(center)
+
+        x = torch.cat((cls_tokens, group_input_tokens), dim=1)
+        pos = torch.cat((cls_pos, pos), dim=1)
+
+        # transformer
+        x = self.blocks(x, pos)
+        x = self.norm(x)
+
+        # Extract cls token, mean pool, and max pool as 3 channels [B, 3, output_dim]
+        features = torch.stack([
+            self.out_projection(x[:, 0]),  # cls token
+            self.out_projection(x[:, 1:].mean(1)),  # mean pool
+            self.out_projection(x[:, 1:].max(1)[0])  # max pool
+        ], dim=1)  # [B, 3, output_dim]
+
+        return features
